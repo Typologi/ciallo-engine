@@ -195,11 +195,18 @@ pub fn mat4_compose_trs(translation: Vec3, rotation: Mat4, scale: Vec3) -> Mat4 
 /// - `translation`：把局部原点放到父空间中的目标位置。
 /// - `rotation`：在局部原点旋转当前节点朝向。
 /// - `scale`：在局部原点按轴缩放当前节点尺寸。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Transform {
-    pub translation: Vec3,
-    pub rotation: Quat,
-    pub scale: Vec3,
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+    // local 矩阵缓存：只有 TRS 本身变化时才需要重算。
+    local_dirty: bool,
+    cached_local: Mat4,
+    // global 矩阵缓存：自身脏、或父矩阵变化时才需要重算。
+    global_dirty: bool,
+    cached_global: Mat4,
+    last_parent_global: Option<Mat4>,
 }
 
 impl Default for Transform {
@@ -208,17 +215,81 @@ impl Default for Transform {
             translation: Vec3::ZERO,
             rotation: Quat::IDENTITY,
             scale: Vec3::ONE,
+            local_dirty: true,
+            cached_local: Mat4::IDENTITY,
+            global_dirty: true,
+            cached_global: Mat4::IDENTITY,
+            last_parent_global: None,
         }
     }
 }
 
 impl Transform {
+    pub fn new(translation: Vec3, rotation: Quat, scale: Vec3) -> Self {
+        let mut t = Self::default();
+        t.translation = translation;
+        t.rotation = rotation;
+        t.scale = scale;
+        t
+    }
+
+    pub fn translation(&self) -> Vec3 {
+        self.translation
+    }
+
+    pub fn rotation(&self) -> Quat {
+        self.rotation
+    }
+
+    pub fn scale(&self) -> Vec3 {
+        self.scale
+    }
+
+    pub fn set_translation(&mut self, translation: Vec3) {
+        self.translation = translation;
+        self.mark_dirty();
+    }
+
+    pub fn set_rotation(&mut self, rotation: Quat) {
+        self.rotation = rotation;
+        self.mark_dirty();
+    }
+
+    pub fn set_scale(&mut self, scale: Vec3) {
+        self.scale = scale;
+        self.mark_dirty();
+    }
+
+    /// 把 local/global 缓存都标记为失效。
+    ///
+    /// 只要 TRS 任一分量变化，local 会变化，global 也会随之变化。
+    pub fn mark_dirty(&mut self) {
+        self.local_dirty = true;
+        self.global_dirty = true;
+    }
+
+    pub fn is_local_dirty(&self) -> bool {
+        self.local_dirty
+    }
+
+    pub fn is_global_dirty(&self) -> bool {
+        self.global_dirty
+    }
+
     /// 返回从 local 空间到 parent 空间的局部矩阵。
     ///
     /// 组合约定：
     /// - 写法是 `T * R * S`，对应先缩放、再旋转、最后平移。
-    pub fn local_matrix(&self) -> Mat4 {
-        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    pub fn local_matrix(&mut self) -> Mat4 {
+        if self.local_dirty {
+            self.cached_local = Mat4::from_scale_rotation_translation(
+                self.scale,
+                self.rotation,
+                self.translation,
+            );
+            self.local_dirty = false;
+        }
+        self.cached_local
     }
 
     /// 返回从 local 空间到 world 空间的全局矩阵。
@@ -226,12 +297,27 @@ impl Transform {
     /// 规则：
     /// - 没有父节点时，`global = local`。
     /// - 有父节点时，`global = parent_global * local`。
-    pub fn global_matrix(&self, parent_global: Option<Mat4>) -> Mat4 {
-        let local = self.local_matrix();
-        match parent_global {
-            Some(parent) => parent * local,
-            None => local,
+    pub fn global_matrix(&mut self, parent_global: Option<Mat4>) -> Mat4 {
+        let parent_changed = !same_parent_matrix(parent_global, self.last_parent_global);
+        if self.global_dirty || parent_changed {
+            let local = self.local_matrix();
+            self.cached_global = match parent_global {
+                Some(parent) => parent * local,
+                None => local,
+            };
+            self.last_parent_global = parent_global;
+            self.global_dirty = false;
         }
+        self.cached_global
+    }
+}
+
+fn same_parent_matrix(a: Option<Mat4>, b: Option<Mat4>) -> bool {
+    const EPSILON: f32 = 1e-6;
+    match (a, b) {
+        (Some(lhs), Some(rhs)) => lhs.abs_diff_eq(rhs, EPSILON),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -332,16 +418,14 @@ mod tests {
 
     #[test]
     fn transform_default_is_identity() {
-        let t = Transform::default();
+        let mut t = Transform::default();
         assert!(t.local_matrix().abs_diff_eq(Mat4::IDENTITY, EPSILON));
     }
 
     #[test]
     fn transform_local_matrix_translates_points() {
-        let t = Transform {
-            translation: Vec3::new(1.0, 2.0, 3.0),
-            ..Default::default()
-        };
+        let mut t = Transform::default();
+        t.set_translation(Vec3::new(1.0, 2.0, 3.0));
 
         let moved = t.local_matrix().transform_point3(Vec3::ZERO);
         assert!(moved.abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), EPSILON));
@@ -349,10 +433,8 @@ mod tests {
 
     #[test]
     fn transform_local_matrix_rotates_direction() {
-        let t = Transform {
-            rotation: Quat::from_rotation_y(FRAC_PI_2),
-            ..Default::default()
-        };
+        let mut t = Transform::default();
+        t.set_rotation(Quat::from_rotation_y(FRAC_PI_2));
 
         let dir = t.local_matrix().transform_vector3(Vec3::X);
         assert!(dir.abs_diff_eq(-Vec3::Z, EPSILON));
@@ -360,10 +442,8 @@ mod tests {
 
     #[test]
     fn transform_local_matrix_scales_vector() {
-        let t = Transform {
-            scale: Vec3::new(2.0, 3.0, 4.0),
-            ..Default::default()
-        };
+        let mut t = Transform::default();
+        t.set_scale(Vec3::new(2.0, 3.0, 4.0));
 
         let out = t.local_matrix().transform_vector3(Vec3::new(1.0, 1.0, 1.0));
         assert!(out.abs_diff_eq(Vec3::new(2.0, 3.0, 4.0), EPSILON));
@@ -371,11 +451,11 @@ mod tests {
 
     #[test]
     fn transform_global_matrix_without_parent_matches_local() {
-        let t = Transform {
-            translation: Vec3::new(1.0, 2.0, 3.0),
-            rotation: Quat::from_rotation_z(FRAC_PI_2),
-            scale: Vec3::new(2.0, 2.0, 2.0),
-        };
+        let mut t = Transform::new(
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::from_rotation_z(FRAC_PI_2),
+            Vec3::new(2.0, 2.0, 2.0),
+        );
 
         let local = t.local_matrix();
         let global = t.global_matrix(None);
@@ -384,14 +464,10 @@ mod tests {
 
     #[test]
     fn transform_global_matrix_with_parent_propagates_hierarchy() {
-        let parent = Transform {
-            translation: Vec3::new(5.0, 0.0, 0.0),
-            ..Default::default()
-        };
-        let child = Transform {
-            translation: Vec3::new(0.0, 2.0, 0.0),
-            ..Default::default()
-        };
+        let mut parent = Transform::default();
+        parent.set_translation(Vec3::new(5.0, 0.0, 0.0));
+        let mut child = Transform::default();
+        child.set_translation(Vec3::new(0.0, 2.0, 0.0));
 
         let parent_global = parent.global_matrix(None);
         let child_global = child.global_matrix(Some(parent_global));
@@ -402,18 +478,12 @@ mod tests {
 
     #[test]
     fn transform_global_matrix_works_for_grandparent_chain() {
-        let grandparent = Transform {
-            translation: Vec3::new(1.0, 0.0, 0.0),
-            ..Default::default()
-        };
-        let parent = Transform {
-            translation: Vec3::new(0.0, 2.0, 0.0),
-            ..Default::default()
-        };
-        let child = Transform {
-            translation: Vec3::new(0.0, 0.0, 3.0),
-            ..Default::default()
-        };
+        let mut grandparent = Transform::default();
+        grandparent.set_translation(Vec3::new(1.0, 0.0, 0.0));
+        let mut parent = Transform::default();
+        parent.set_translation(Vec3::new(0.0, 2.0, 0.0));
+        let mut child = Transform::default();
+        child.set_translation(Vec3::new(0.0, 0.0, 3.0));
 
         let grandparent_global = grandparent.global_matrix(None);
         let parent_global = parent.global_matrix(Some(grandparent_global));
@@ -421,5 +491,39 @@ mod tests {
 
         let child_origin_in_world = child_global.transform_point3(Vec3::ZERO);
         assert!(child_origin_in_world.abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), EPSILON));
+    }
+
+    #[test]
+    fn transform_setters_mark_dirty_and_recompute_on_demand() {
+        let mut t = Transform::default();
+
+        let _ = t.local_matrix();
+        let _ = t.global_matrix(None);
+        assert!(!t.is_local_dirty());
+        assert!(!t.is_global_dirty());
+
+        t.set_translation(Vec3::new(2.0, 0.0, 0.0));
+        assert!(t.is_local_dirty());
+        assert!(t.is_global_dirty());
+
+        let moved = t.global_matrix(None).transform_point3(Vec3::ZERO);
+        assert!(moved.abs_diff_eq(Vec3::new(2.0, 0.0, 0.0), EPSILON));
+        assert!(!t.is_local_dirty());
+        assert!(!t.is_global_dirty());
+    }
+
+    #[test]
+    fn transform_recomputes_global_when_parent_changes() {
+        let mut child = Transform::default();
+        child.set_translation(Vec3::new(0.0, 1.0, 0.0));
+
+        let parent_a = Mat4::from_translation(Vec3::new(1.0, 0.0, 0.0));
+        let parent_b = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
+
+        let world_a = child.global_matrix(Some(parent_a)).transform_point3(Vec3::ZERO);
+        let world_b = child.global_matrix(Some(parent_b)).transform_point3(Vec3::ZERO);
+
+        assert!(world_a.abs_diff_eq(Vec3::new(1.0, 1.0, 0.0), EPSILON));
+        assert!(world_b.abs_diff_eq(Vec3::new(5.0, 1.0, 0.0), EPSILON));
     }
 }

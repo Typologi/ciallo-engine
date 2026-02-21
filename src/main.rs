@@ -1,11 +1,19 @@
-use winit::{application::ApplicationHandler, event::WindowEvent, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, window::{Window, WindowId}};
+use std::sync::Arc;
 
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    window::{Window, WindowId},
+};
+
+pub mod camera;
 pub mod renderer;
 pub mod math;
 
 #[derive(Default)]
 struct CialloEngineApp {
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
     renderer: Option<renderer::CialloRenderer>,
 }
 
@@ -13,8 +21,18 @@ impl ApplicationHandler for CialloEngineApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match event_loop.create_window(Window::default_attributes()) {
             Ok(window) => {
-                self.renderer = Some(renderer::CialloRenderer::new());
-                self.window = Some(window);
+                let window = Arc::new(window);
+
+                match pollster::block_on(renderer::CialloRenderer::new(window.clone())) {
+                    Ok(renderer) => {
+                        self.renderer = Some(renderer);
+                        self.window = Some(window);
+                    }
+                    Err(err) => {
+                        log::error!("{err}");
+                        event_loop.exit();
+                    }
+                }
             }
             Err(err) => {
                 log::error!("Failed to create window: {err}");
@@ -28,7 +46,22 @@ impl ApplicationHandler for CialloEngineApp {
             WindowEvent::CloseRequested => {
                 log::info!("The close button was pressed; stopping");
                 event_loop.exit();
-            },
+            }
+            WindowEvent::Resized(new_size) => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(new_size);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.handle_mouse_input(button, state);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.handle_cursor_moved(position.x, position.y);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 // Redraw the application.
                 //
@@ -60,12 +93,19 @@ impl ApplicationHandler for CialloEngineApp {
 
 fn main() {
     env_logger::init();
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = match EventLoop::new() {
+        Ok(event_loop) => event_loop,
+        Err(err) => {
+            log::error!("Failed to create event loop: {err}");
+            return;
+        }
+    };
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = CialloEngineApp::default();
 
-    let _ = event_loop.run_app(&mut app);
-    // ...
+    if let Err(err) = event_loop.run_app(&mut app) {
+        log::error!("Failed to run app: {err}");
+    }
 }
